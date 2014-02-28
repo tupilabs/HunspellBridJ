@@ -1,23 +1,71 @@
 package com.atlascopco.hunspell;
 
 import java.io.Closeable;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
+import java.nio.charset.Charset;
+import java.text.Collator;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.bridj.Pointer;
 
 import com.atlascopco.hunspell.HunspellLibrary.Hunhandle;
+import com.google.code.externalsorting.ExternalSort;
 
 /**
  * This class implements an object-oriented interface to the C API for Hunspell.
  * 
  * @author Thomas Joiner
- * 
+ * @author Bruno P. Kinoshita
  */
 public class Hunspell implements Closeable {
 	
+	public static final Logger LOGGER = Logger.getLogger(Hunspell.class.getName());
+	
 	private Pointer<Hunhandle> handle;
 	private Exception closedAt;
+	
+	private final Set<String> diff = new HashSet<String>();
+	
+	private final String dictionaryPath;
+	private final String affixPath;
+	
+	private static final String LINE_SEPARATOR = System.getProperty("line.separator");
+	
+	private final Charset charset;
+	private final Locale locale;
+	
+	/**
+	 * A comparator that uses locale. 
+	 * @see {@link Collator}
+	 */
+	private static class LocaleComparator implements Comparator<String> {
+
+		private Collator collator;
+
+		LocaleComparator(Locale locale) {
+			this.collator = Collator.getInstance(locale);
+		}
+		
+		@Override
+		public int compare(String o1, String o2) {
+			return collator.compare(o1, o2);
+		}
+		
+	}
 	
 	/**
 	 * Instantiate a hunspell object with the given dictionary and affix file
@@ -25,6 +73,22 @@ public class Hunspell implements Closeable {
 	 * @param affixPath the path to the affix file
 	 */
 	public Hunspell(String dictionaryPath, String affixPath) {
+		this(dictionaryPath, affixPath, Charset.defaultCharset(), Locale.getDefault());
+	}
+	
+	/**
+	 * Instantiate a hunspell object with the given dictionary and affix file
+	 * @param dictionaryPath the path to the dictionary
+	 * @param affixPath the path to the affix file
+	 * @param charset charset used
+	 * @param locale locale used
+	 */
+	public Hunspell(String dictionaryPath, String affixPath, Charset charset, Locale locale) {
+		this.affixPath = affixPath;
+		this.dictionaryPath = dictionaryPath;
+		this.charset = charset;
+		this.locale = locale;
+		
 		Pointer<Byte> affpath = Pointer.pointerToCString(affixPath);
 		Pointer<Byte> dpath = Pointer.pointerToCString(dictionaryPath);
 		
@@ -57,6 +121,38 @@ public class Hunspell implements Closeable {
 	 * @param key the key used to encrypt the dictionary files
 	 */
 	public Hunspell(String dictionaryPath, String affixPath, String key) {
+		this(dictionaryPath, affixPath, key, Charset.defaultCharset(), Locale.getDefault());
+	}
+	
+	/**
+	 * <p>
+	 * Instantiate a hunspell object with the given hunzipped dictionary and
+	 * affix files.
+	 * </p>
+	 * 
+	 * <p>
+	 * This is, however more complicated than it looks. Note that the paths
+	 * aren't actually to the hunzipped dictionary and affix files, they are the
+	 * paths to what they would be named if they weren't hunzipped. In other
+	 * words, if you have the files {@code /path/to/dictionary.dic.hz} and
+	 * {@code /path/to/dictionary.aff.hz} you would call
+	 * {@code new Hunspell("/path/to/dictionary.dic", "/path/to/dictionary.aff", "password")}
+	 * . Note, however, that if the paths that you give actually exist, those
+	 * will be prioritized over the hunzipped versions and will be used instead.
+	 * </p>
+	 * 
+	 * @param dictionaryPath the path to the dictionary
+	 * @param affixPath the path to the affix file
+	 * @param key the key used to encrypt the dictionary files
+	 * @param charset the charset used
+	 * @param locale the locale used
+	 */
+	public Hunspell(String dictionaryPath, String affixPath, String key, Charset charset, Locale locale) {
+		this.affixPath = affixPath;
+		this.dictionaryPath = dictionaryPath;
+		this.charset = charset;
+		this.locale = locale;
+		
 		Pointer<Byte> affpath = Pointer.pointerToCString(affixPath);
 		Pointer<Byte> dpath = Pointer.pointerToCString(dictionaryPath);
 		Pointer<Byte> keyCString = Pointer.pointerToCString(key);
@@ -66,6 +162,133 @@ public class Hunspell implements Closeable {
 		if ( this.handle == null ) {
 			throw new RuntimeException("Unable to instantiate Hunspell handle.");
 		}
+	}
+	
+	/**
+	 * Return diff.
+	 * @return diff
+	 */
+	public Set<String> getDiff() {
+		return diff;
+	}
+	
+	/**
+	 * Return affix path.
+	 * @return affix path
+	 */
+	/* default */ String getAffixPath() {
+		return affixPath;
+	}
+	
+	/**
+	 * Return dictionary path.
+	 * @return dictionary path
+	 */
+	/* default */ String getDictionaryPath() {
+		return dictionaryPath;
+	}
+	
+	/**
+	 * @throws RuntimeException
+	 */
+	public void updateDictionary() {
+		if (LOGGER.isLoggable(Level.FINEST))
+				LOGGER.finest("Updating dictionary " + dictionaryPath);
+		
+		Set<String> diff = getDiff();
+		LocaleComparator comparator = new LocaleComparator(locale);
+		
+		RandomAccessFile dictionaryFile = null;
+		FileChannel channel = null;
+		
+		try {
+			dictionaryFile = new RandomAccessFile(dictionaryPath, "rw");
+			
+			channel = dictionaryFile.getChannel();
+			ByteBuffer buffer = channel.map(MapMode.READ_ONLY, 0, 100);
+			
+			StringBuilder wordCount = new StringBuilder();
+			for (int i = 0; i < buffer.remaining(); ++i) {
+				char c = (char) buffer.get();
+				if (c == '\n') {
+					break;
+				}
+				wordCount.append(c);
+			}
+			
+			long entries = Long.parseLong(wordCount.toString().trim());
+			if (LOGGER.isLoggable(Level.FINEST))
+				LOGGER.finest("Dictionary had " + entries + " entries. Adding new entries.");
+			
+			try {
+				StringBuilder newEntries = new StringBuilder();
+				for (String word : diff) {
+					newEntries.append(word + LINE_SEPARATOR);
+				}
+				CharBuffer charBuffer = CharBuffer.wrap(newEntries.toString());
+				channel.position(channel.size());
+				channel.write(charset.encode(charBuffer));
+			} catch (IOException e) {
+				throw new RuntimeException("Failed to update dictionary " + dictionaryPath, e);
+			} 
+			
+			entries += diff.size();
+			if (LOGGER.isLoggable(Level.FINEST))
+				LOGGER.finest("Dictionary updating number of entries to " + entries);
+			channel.position(0);
+			channel.write(ByteBuffer.wrap((""+entries).getBytes()));
+			
+			if (LOGGER.isLoggable(Level.FINEST))
+				LOGGER.finest("Sorting dictionary " + dictionaryPath);
+			
+		} catch (FileNotFoundException e2) {
+			throw new RuntimeException("Failed to open dictionary " + dictionaryPath, e2);
+		} catch (IOException e1) {
+			throw new RuntimeException("Failed to open dictionary " + dictionaryPath, e1);
+		} finally {
+			if (null != channel) {
+				try {
+					channel.close();
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+			}
+			if (null != dictionaryFile) {
+				try {
+					dictionaryFile.close();
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+
+		// FIXME: fix encoding problem while merging files
+		File input = new File(dictionaryPath);
+		File output = new File(dictionaryPath);
+		try {
+			ExternalSort.mergeSortedFiles(
+					ExternalSort.sortInBatch(
+							input,
+							comparator, 
+							ExternalSort.DEFAULTMAXTEMPFILES, 
+							charset,
+							null, 
+							true, 
+							1, 
+							false), 
+					output, 
+					comparator, 
+					charset, 
+					true, 
+					false, 
+					false);
+		} catch (IOException e) {
+			throw new RuntimeException("Failed to sort dictionary "
+					+ dictionaryPath, e);
+		}
+		
+		if (LOGGER.isLoggable(Level.FINEST))
+			LOGGER.finest("Dictionary " + dictionaryPath + " updated!");
 	}
 
 	/**
@@ -323,6 +546,8 @@ public class Hunspell implements Closeable {
 		if ( result != 0 ) {
 			throw new RuntimeException("An error occurred when calling Hunspell_add: "+result);
 		}
+		
+		this.diff.add(word);
 	}
 
 	/**
@@ -347,6 +572,8 @@ public class Hunspell implements Closeable {
 		if ( result != 0 ) {
 			throw new RuntimeException("An error occurred when calling Hunspell_add_with_affix: "+result);
 		}
+		
+		this.diff.add(word);
 	}
 
 	/**
